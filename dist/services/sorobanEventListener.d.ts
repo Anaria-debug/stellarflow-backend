@@ -41,6 +41,16 @@ export declare class SorobanEventListener {
      * Expected event data: varies by event type
      */
     private pollCircuitBreakerEvents;
+    /**
+     * Polls Soroban for checkpointCreated events emitted by the governance contract
+     * and stores voting power checkpoints for proposal voting eligibility.
+     *
+     * Expected event topics: ["checkpointCreated", accountId]
+     * Expected event data:   { votingWeight: string }
+     *
+     * Implements Issue #1044: Store historical voting power checkpoints at specific ledger numbers.
+     */
+    private pollVotingPowerCheckpointEvents;
     private extractMemoId;
     private parseOperations;
     stop(): void;

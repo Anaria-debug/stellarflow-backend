@@ -8,6 +8,7 @@ import { verifyOrderFilledEvent } from "./orderFillVerificationService.js";
 import { ingestGovernanceVoteEvent } from "./voterHistoryService.js";
 import { getCacheInvalidationManager } from "../cache/CacheInvalidationManager";
 import { getOrderBookSnapshotEngine } from "./orderBookSnapshotEngine";
+import { getAmmReserveDivergenceDetector } from "./ammReserveDivergenceDetector";
 dotenv.config();
 export class SorobanEventListener {
     bpManager = new BackpressureManager();
@@ -113,6 +114,11 @@ export class SorobanEventListener {
                     orderBookSnapshotEngine.onNewLedger(price.ledgerSeq).catch((err) => {
                         logger.error("[EventListener] Order book snapshot failed:", err);
                     });
+                    getAmmReserveDivergenceDetector()
+                        ?.onNewLedger(price.ledgerSeq)
+                        .catch((err) => {
+                        logger.error("[EventListener] AMM reserve divergence check failed:", err);
+                    });
                 }
                 catch (err) {
                     logger.error("[Worker] Failed to process queued price:", err);
@@ -130,6 +136,7 @@ export class SorobanEventListener {
             await this.pollOrderFilledEvents();
             await this.pollGovernanceVoteEvents();
             await this.pollCircuitBreakerEvents();
+            await this.pollVotingPowerCheckpointEvents();
             const transactions = await this.server
                 .transactions()
                 .forAccount(this.oraclePublicKey)
@@ -326,6 +333,64 @@ export class SorobanEventListener {
             }
             catch (err) {
                 logger.error("[EventListener] Failed to process circuit breaker event:", err);
+            }
+        }
+    }
+    /**
+     * Polls Soroban for checkpointCreated events emitted by the governance contract
+     * and stores voting power checkpoints for proposal voting eligibility.
+     *
+     * Expected event topics: ["checkpointCreated", accountId]
+     * Expected event data:   { votingWeight: string }
+     *
+     * Implements Issue #1044: Store historical voting power checkpoints at specific ledger numbers.
+     */
+    async pollVotingPowerCheckpointEvents() {
+        const contractId = (process.env.GOVERNANCE_CONTRACT_ID ?? process.env.CONTRACT_ID)?.trim();
+        if (!contractId)
+            return;
+        const rpc = stellarProvider.getRpcServer();
+        let response;
+        try {
+            response = await rpc.getEvents({
+                startLedger: Math.max(1, this.lastProcessedLedger),
+                filters: [
+                    {
+                        type: "contract",
+                        contractIds: [contractId],
+                        topics: [["checkpointCreated", "*"]],
+                    },
+                ],
+                limit: 200,
+            });
+        }
+        catch (err) {
+            logger.networkError("[EventListener] checkpointCreated poll failed:", {
+                err,
+            });
+            return;
+        }
+        for (const event of response.events ?? []) {
+            try {
+                // Topics: [eventName, accountId]
+                const topics = event.topic ?? [];
+                const accountId = topics[1];
+                if (!accountId)
+                    continue;
+                // Data value is a Soroban SCVal map – coerce to plain object
+                const dataVal = event.value?.value ?? event.value ?? {};
+                const votingWeight = dataVal.votingWeight ?? "0";
+                const ledger = Number(event.ledger ?? 0);
+                await storeVotingPowerCheckpoint({
+                    accountId,
+                    ledgerSequence: ledger,
+                    votingWeight,
+                });
+                if (ledger > this.lastProcessedLedger)
+                    this.lastProcessedLedger = ledger;
+            }
+            catch (err) {
+                logger.error("[EventListener] Failed to ingest checkpointCreated event:", err);
             }
         }
     }
