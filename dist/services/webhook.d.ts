@@ -20,6 +20,8 @@ type GasBalanceAlertDetails = {
     currentBalance: number;
     threshold: number;
     walletAddress?: string;
+    /** Names a relayer gas pool (Issue #1058); omitted for the admin wallet. */
+    poolLabel?: string;
     timestamp: Date;
 };
 type MonitorFailureAlertDetails = {

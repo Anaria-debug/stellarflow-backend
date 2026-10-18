@@ -210,13 +210,19 @@ export class WebhookService {
     // FIX 1: Added Slack branch — previously always returned a Discord embed,
     // which would be silently dropped or mangled when NOTIFICATION_PLATFORM=slack.
     formatGasBalanceAlert(alertDetails) {
-        const { currentBalance, threshold, walletAddress, timestamp } = alertDetails;
+        const { currentBalance, threshold, walletAddress, poolLabel, timestamp } = alertDetails;
         const deficit = (threshold - currentBalance).toFixed(2);
+        const title = poolLabel
+            ? `🚨 CRITICAL: Low Relayer Gas Balance (${poolLabel})`
+            : "🚨 CRITICAL: Low Gas Balance Alert";
+        const action = poolLabel
+            ? `Top up this relayer wallet (${poolLabel}) with XLM so it can keep paying transaction fees`
+            : "Top up the admin wallet with XLM to ensure transaction fees can be paid";
         if (this.platform === "discord") {
             return {
                 embeds: [
                     {
-                        title: "🚨 CRITICAL: Low Gas Balance Alert",
+                        title,
                         color: 0xff0000,
                         fields: [
                             {
@@ -244,7 +250,7 @@ export class WebhookService {
                                 : []),
                             {
                                 name: "Action Required",
-                                value: "Top up the admin wallet with XLM to ensure transaction fees can be paid",
+                                value: action,
                             },
                             { name: "Time", value: timestamp.toISOString() },
                         ],
@@ -258,7 +264,7 @@ export class WebhookService {
                     type: "header",
                     text: {
                         type: "plain_text",
-                        text: "🚨 CRITICAL: Low Gas Balance Alert",
+                        text: title,
                     },
                 },
                 {
@@ -284,7 +290,7 @@ export class WebhookService {
                     type: "section",
                     text: {
                         type: "mrkdwn",
-                        text: "*Action Required:*\nTop up the admin wallet with XLM to ensure transaction fees can be paid",
+                        text: `*Action Required:*\n${action}`,
                     },
                 },
                 {
