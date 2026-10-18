@@ -3,6 +3,7 @@
 Provides a centralized service to capture high-risk administrative operations,
 cryptographically sign them using KMS, and store them in PostgreSQL. Ensures all
 audit records are immutable, tamper-proof, and searchable for compliance purposes.
+Additionally provides an audit logger for vault liquidation execution results.
 """
 
 from __future__ import annotations
@@ -11,9 +12,12 @@ import base64
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Union
+
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit import AuditLog, AdministrativeOperationType
+from app.models.liquidation_audit import LiquidationAuditLog, VaultLiquidatedEvent
 from app.security.kms import KeyRotationHandler, verify_signed_envelope, KeyHandle
 from app.db.session import async_session_factory
 
@@ -23,6 +27,9 @@ __all__ = [
     "AuditLogger",
     "get_audit_logger",
     "log_administrative_operation",
+    "LiquidationAuditLogger",
+    "get_liquidation_audit_logger",
+    "init_liquidation_audit_logger",
 ]
 
 
@@ -38,7 +45,7 @@ class AuditLogger:
         """Initialize the audit logger with a KMS key handler for signing.
 
         Parameters
-        ----------
+        ---------
         key_handler : KeyRotationHandler
             The active key rotation handler that provides access to signing keys.
         """
@@ -152,7 +159,7 @@ class AuditLogger:
         """Verify the integrity and authenticity of an existing audit record.
 
         Parameters
-        ----------
+        ---------
         record : AuditLog
             The audit record to verify.
 
@@ -186,8 +193,267 @@ class AuditLogger:
             return False
 
 
+class LiquidationAuditLogger:
+    """Audit logger for vault liquidation execution results.
+
+    Records detailed execution logs for every vault liquidation event, capturing
+    seized collateral and debt cleared. Supports indexing from contract ledger
+    streams and cursor-based pagination for history queries.
+    """
+
+    def __init__(self, key_handler: Optional[KeyRotationHandler] = None):
+        """Initialize the liquidation audit logger.
+
+        Parameters
+        ----------
+        key_handler : Optional[KeyRotationHandler]
+            Optional KMS key handler used to sign liquidation audit records.
+        """
+        self.key_handler = key_handler
+
+    async def log_liquidation(
+        self,
+        vault_id: str,
+        liquidator: str,
+        seized_collateral: Dict[str, Any],
+        cleared_debt: Dict[str, Any],
+        gas_paid: Optional[Union[int, str, float]] = None,
+        transaction_hash: Optional[str] = None,
+        block_number: Optional[int] = None,
+        executed_at: Optional[datetime] = None,
+        extra_metadata: Optional[Dict[str, Any]] = None,
+        session: Optional[AsyncSession] = None,
+    ) -> LiquidationAuditLog:
+        """Persist an audit log record for a single vault liquidation execution.
+
+        This method captures the complete execution metadata for a liquidation and
+        stores it in the `liquidation_audit_logs` table. If a KMS key handler is
+        configured, the record is cryptographically signed for tamper-proof integrity.
+
+        Parameters
+        ----------
+        vault_id : str
+            The vault identifier that was liquidated.
+        liquidator : str
+            Address/identifier of the liquidator.
+        seized_collateral : Dict[str, Any]
+            Details of the collateral seized (asset, amount, etc.).
+        cleared_debt : Dict[str, Any]
+            Details of the debt cleared (asset, amount, etc.).
+        gas_paid : Optional[Union[int, str, float]]
+            Gas paid for the liquidation execution.
+        transaction_hash : Optional[str]
+            On-chain transaction hash of the liquidation.
+        block_number : Optional[int]
+            Block number where the liquidation was executed.
+        executed_at : Optional[datetime]
+            Timestamp of execution. Defaults to now if not provided.
+        extra_metadata : Optional[Dict[str, Any]]
+            Additional execution metadata to store.
+        session : Optional[AsyncSession]
+            Existing database session to use, if provided.
+
+        Returns
+        -------
+        LiquidationAuditLog
+            The created and persisted liquidation audit log record.
+        """
+        executed_at = executed_at or datetime.now(timezone.utc)
+        if executed_at.tzinfo is None:
+            executed_at = executed_at.replace(tzinfo=timezone.utc)
+
+        record = LiquidationAuditLog(
+            vault_id=vault_id,
+            liquidator=liquidator,
+            seized_collateral=seized_collateral,
+            cleared_debt=cleared_debt,
+            gas_paid=gas_paid,
+            transaction_hash=transaction_hash,
+            block_number=block_number,
+            executed_at=executed_at,
+            extra_metadata=extra_metadata or {},
+            key_id=None,
+            record_hash="",
+            signature=None,
+        )
+
+        # Compute integrity hash and optionally sign the record
+        record_hash = record.compute_record_hash()
+        record.record_hash = record_hash
+
+        if self.key_handler is not None:
+            active_key: Optional[KeyHandle] = self.key_handler.get_active_key()
+            if not active_key:
+                logger.error("No active signing key available to sign liquidation audit log")
+                raise RuntimeError(
+                    "Cannot create liquidation audit log: no active signing key available"
+                )
+            signature_bytes = await self.key_handler.sign_bytes(
+                record_hash.encode("utf-8"), active_key
+            )
+            record.key_id = active_key.key_id
+            record.signature = base64.b64encode(signature_bytes).decode("utf-8")
+
+        should_close_session = False
+        if session is None:
+            session = async_session_factory()
+            should_close_session = True
+
+        try:
+            session.add(record)
+            await session.commit()
+            await session.refresh(record)
+            logger.info(
+                "Recorded liquidation audit log: id=%s, vault=%s, liquidator=%s",
+                record.id, record.vault_id, record.liquidator,
+            )
+            return record
+        except Exception as exc:
+            await session.rollback()
+            logger.error("Failed to persist liquidation audit log: %s", exc)
+            raise
+        finally:
+            if should_close_session:
+                await session.close()
+
+    async def index_event(
+        self,
+        event: VaultLiquidatedEvent,
+        session: Optional[AsyncSession] = None,
+    ) -> LiquidationAuditLog:
+        """Index a single `VaultLiquidated` event from a contract ledger stream.
+
+        Parameters
+        ----------
+        event : VaultLiquidatedEvent
+            The decoded on-chain event to index.
+        session : Optional[AsyncSession]
+            Existing database session to use, if provided.
+
+        Returns
+        -------
+        LiquidationAuditLog
+            The persisted audit log record for the event.
+        """
+        return await self.log_liquidation(
+            vault_id=event.vault_id,
+            liquidator=event.liquidator,
+            seized_collateral=event.seized_collateral,
+            cleared_debt=event.cleared_debt,
+            gas_paid=event.gas_paid,
+            transaction_hash=event.transaction_hash,
+            block_number=event.block_number,
+            executed_at=event.executed_at,
+            extra_metadata=event.extra_metadata,
+            session=session,
+        )
+
+    async def index_events(
+        self,
+        events: Iterable[VaultLiquidatedEvent],
+        session: Optional[AsyncSession] = None,
+    ) -> List[LiquidationAuditLog]:
+        """Index a batch of `VaultLiquidated` events from a contract ledger stream.
+
+        All records are persisted within a single transaction so that the audit log
+        remains consistent with the indexed ledger stream.
+        """
+        should_close_session = False
+        if session is None:
+            session = async_session_factory()
+            should_close_session = True
+
+        records: List[LiquidationAuditLog] = []
+        try:
+            for event in events:
+                record = await self.log_liquidation(
+                    vault_id=event.vault_id,
+                    liquidator=event.liquidator,
+                    seized_collateral=event.seized_collateral,
+                    cleared_debt=event.cleared_debt,
+                    gas_paid=event.gas_paid,
+                    transaction_hash=event.transaction_hash,
+                    block_number=event.block_number,
+                    executed_at=event.executed_at,
+                    extra_metadata=event.extra_metadata,
+                    session=session,
+                )
+                records.append(record)
+            await session.commit()
+            return records
+        except Exception as exc:
+            await session.rollback()
+            logger.error("Failed to index vault liquidated events: %s", exc)
+            raise
+        finally:
+            if should_close_session:
+                await session.close()
+
+    async def get_history(
+        self,
+        cursor: Optional[int] = None,
+        limit: int = 50,
+        vault_id: Optional[str] = None,
+        liquidator: Optional[str] = None,
+        session: Optional[AsyncSession] = None,
+    ) -> Dict[str, Any]:
+        """Retrieve liquidation history with cursor-based pagination.
+
+        Parameters
+        ----------
+        cursor : Optional[int]
+            ID of the last record returned in the previous page.
+        limit : int
+            Maximum number of records to return.
+        vault_id : Optional[str]
+            Optional filter by vault identifier.
+        liquidator : Optional[str]
+            Optional filter by liquidator.
+        session : Optional[AsyncSession]
+            Existing database session to use, if provided.
+
+        Returns
+        -------
+        Dict[str, Any]
+            Dictionary with `items`, `next_cursor`, and `has_more` fields.
+        """
+        limit = max(1, min(limit, 500))
+
+        stmt = select(LiquidationAuditLog).order_by(LiquidationAuditLog.id.asc())
+        if cursor is not None:
+            stmt = stmt.where(LiquidationAuditLog.id > cursor)
+        if vault_id is not None:
+            stmt = stmt.where(LiquidationAuditLog.vault_id == vault_id)
+        if liquidator is not None:
+            stmt = stmt.where(LiquidationAuditLog.liquidator == liquidator)
+        stmt = stmt.limit(limit + 1)
+
+        should_close_session = False
+        if session is None:
+            session = async_session_factory()
+            should_close_session = True
+
+        try:
+            result = await session.execute(stmt)
+            rows = list(result.scalars().all())
+        finally:
+            if should_close_session:
+                await session.close()
+
+        has_more = len(rows) > limit
+        items = rows[:limit]
+        next_cursor = items[-1].id if items and has_more else None
+
+        return {
+            "items": [record.to_dict() for record in items],
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+        }
+
+
 # Singleton instance
 _audit_logger: Optional[AuditLogger] = None
+_liquidation_audit_logger: Optional[LiquidationAuditLogger] = None
 
 
 def get_audit_logger() -> AuditLogger:
@@ -219,6 +485,33 @@ def init_audit_logger(key_handler: KeyRotationHandler) -> None:
     global _audit_logger
     _audit_logger = AuditLogger(key_handler)
     logger.info("Audit logger initialized successfully")
+
+
+def get_liquidation_audit_logger() -> LiquidationAuditLogger:
+    """Get or create the singleton liquidation audit logger instance.
+
+    Returns
+    -------
+    LiquidationAuditLogger
+        The global liquidation audit logger instance.
+    """
+    global _liquidation_audit_logger
+    if _liquidation_audit_logger is None:
+        _liquidation_audit_logger = LiquidationAuditLogger()
+    return _liquidation_audit_logger
+
+
+def init_liquidation_audit_logger(key_handler: Optional[KeyRotationHandler] = None) -> None:
+    """Initialize the global liquidation audit logger singleton.
+
+    Parameters
+    ----------
+    key_handler : Optional[KeyRotationHandler]
+        Optional KMS key handler to sign liquidation audit records.
+    """
+    global _liquidation_audit_logger
+    _liquidation_audit_logger = LiquidationAuditLogger(key_handler)
+    logger.info("Liquidation audit logger initialized successfully")
 
 
 async def log_administrative_operation(
