@@ -3,11 +3,13 @@ import json
 import logging
 import hashlib
 import base64
+from datetime import datetime, timezone
 from typing import Optional, Set
 import websockets
 from app.tasks.ingestion_tasks import dispatch_backfill_job
 from app.db.session import async_session_factory
 from app.models.events import LedgerEvent
+from app.models.liquidation import LiquidationAuditLog
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,8 @@ class SorobanListener:
         _compute_xdr_symbol_hash("deposit"),
         _compute_xdr_symbol_hash("Liquidation"),
         _compute_xdr_symbol_hash("liquidation"),
+        _compute_xdr_symbol_hash("VaultLiquidated"),
+        _compute_xdr_symbol_hash("vault_liquidated"),
         _compute_xdr_symbol_hash("GovernanceVoted"),
         hashlib.sha256(b"Swap").hexdigest(),
         hashlib.sha256(b"swap").hexdigest(),
@@ -36,6 +40,8 @@ class SorobanListener:
         hashlib.sha256(b"deposit").hexdigest(),
         hashlib.sha256(b"Liquidation").hexdigest(),
         hashlib.sha256(b"liquidation").hexdigest(),
+        hashlib.sha256(b"VaultLiquidated").hexdigest(),
+        hashlib.sha256(b"vault_liquidated").hexdigest(),
         hashlib.sha256(b"GovernanceVoted").hexdigest(),
     }
 
@@ -127,6 +133,10 @@ class SorobanListener:
 
             # 2. Process & Ingest Current Event
             await self._save_event(event_data, current_sequence)
+
+            # 3. Audit-log vault liquidation executions
+            await self._record_liquidation_audit(event_data, current_sequence)
+
             self.last_ingested_sequence = current_sequence
 
         except Exception as e:
@@ -152,3 +162,77 @@ class SorobanListener:
                 await session.commit()
             except Exception:
                 await session.rollback()  # Ignore duplicate constraint collisions cleanly
+
+    @staticmethod
+    def _is_vault_liquidation_event(event_data: dict) -> bool:
+        """Determines whether the event represents a VaultLiquidated execution."""
+        topics = event_data.get("topic") or event_data.get("topics") or []
+        if not isinstance(topics, list):
+            topics = [topics]
+        for t in topics:
+            if not isinstance(t, str):
+                continue
+            lowered = t.lower()
+            if "vaultliquidated" in lowered or "vault_liquidated" in lowered:
+                return True
+        return False
+
+    @staticmethod
+    def _extract_liquidation_fields(event_data: dict) -> dict:
+        """Extracts liquidation execution metadata from the event payload."""
+        payload = event_data.get("value") or event_data.get("data") or event_data
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except Exception:
+                payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        def _pick(*keys):
+            for k in keys:
+                if k in payload and payload[k] is not None:
+                    return payload[k]
+            return None
+
+        return {
+            "vault_id": _pick("vault_id", "vaultId", "vault"),
+            "liquidator": _pick("liquidator", "liquidator_address", "liquidatorAddress"),
+            "seized_collateral": _pick(
+                "seized_collateral", "seizedCollateral", "collateral_seized"
+            ),
+            "cleared_debt": _pick("cleared_debt", "clearedDebt", "debt_cleared"),
+            "gas_paid": _pick("gas_paid", "gasPaid", "gas"),
+        }
+
+    async def _record_liquidation_audit(self, event_data: dict, sequence: int):
+        """Persists a LiquidationAuditLog row for every executed vault liquidation."""
+        if not self._is_vault_liquidation_event(event_data):
+            return
+
+        tx_hash = event_data.get("txHash", "0x0")
+        event_idx = event_data.get("index", 0)
+        event_hash = self.generate_event_hash(sequence, tx_hash, event_idx)
+        fields = self._extract_liquidation_fields(event_data)
+
+        async with async_session_factory() as session:
+            audit_record = LiquidationAuditLog(
+                event_hash=event_hash,
+                ledger_sequence=sequence,
+                tx_hash=tx_hash,
+                vault_id=str(fields["vault_id"]) if fields["vault_id"] is not None else None,
+                liquidator=fields["liquidator"],
+                seized_collateral=fields["seized_collateral"],
+                cleared_debt=fields["cleared_debt"],
+                gas_paid=fields["gas_paid"],
+                executed_at=datetime.now(timezone.utc),
+                raw_payload=event_data,
+            )
+            session.add(audit_record)
+            try:
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                logger.debug(
+                    f"Liquidation audit duplicate or insert failure for {event_hash}"
+                )

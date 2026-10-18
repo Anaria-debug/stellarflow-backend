@@ -14,16 +14,46 @@ from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import select, and_, or_, desc
 from sqlalchemy import select, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_async_session
 from app.models.audit import AuditLog, AdministrativeOperationType
 from app.services.audit_logger import get_audit_logger, AuditLogger
+from app.models.liquidation import LiquidationAuditLog
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/audit", tags=["audit"])
+
+
+# ---------------------------------------------------------------------------
+# Liquidation audit models
+# ---------------------------------------------------------------------------
+
+class LiquidationAuditLogResponse(BaseModel):
+    """Pydantic model for returning vault liquidation audit records."""
+    id: int
+    vault_id: str
+    liquidator: str
+    seized_collateral: str
+    cleared_debt: str
+    gas_paid: str
+    transaction_hash: Optional[str]
+    block_number: Optional[int]
+    timestamp: datetime
+
+    model_config = {
+        "from_attributes": True
+    }
+
+
+class LiquidationHistoryResponse(BaseModel):
+    """Cursor-paginated response for vault liquidation history."""
+    records: List[LiquidationAuditLogResponse]
+    next_cursor: Optional[str] = Field(None, description="Cursor to fetch the next page of results")
+    has_more: bool
 
 
 # ---------------------------------------------------------------------------
@@ -264,4 +294,72 @@ async def get_operation_types() -> JSONResponse:
     """
     return JSONResponse(
         content=[op.value for op in AdministrativeOperationType]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Liquidation history endpoint
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/liquidations/history",
+    response_model=LiquidationHistoryResponse,
+    summary="Retrieve vault liquidation execution history"
+)
+async def get_liquidation_history(
+    cursor: Optional[str] = Query(None, description="Opaque cursor for pagination (last seen record ID)"),
+    limit: int = Query(50, ge=1, le=500, description="Maximum number of records to return"),
+    vault_id: Optional[str] = Query(None, description="Filter by vault ID"),
+    liquidator: Optional[str] = Query(None, description="Filter by liquidator address"),
+    session: AsyncSession = Depends(get_async_session)
+) -> LiquidationHistoryResponse:
+    """Return cursor-paginated history of executed vault liquidations.
+
+    Records are ordered newest-first by primary key. The `cursor` parameter is the
+    ID of the last record from the previous page; the next page returns records
+    with a strictly smaller ID.
+    """
+    conditions = []
+
+    if cursor is not None:
+        try:
+            cursor_id = int(cursor)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid cursor value"
+            )
+        conditions.append(LiquidationAuditLog.id < cursor_id)
+
+    if vault_id:
+        conditions.append(LiquidationAuditLog.vault_id == vault_id)
+
+    if liquidator:
+        conditions.append(LiquidationAuditLog.liquidator == liquidator)
+
+    query = select(LiquidationAuditLog)
+    if conditions:
+        query = query.where(and_(*conditions))
+    query = query.order_by(desc(LiquidationAuditLog.id)).limit(limit + 1)
+
+    try:
+        result = await session.execute(query)
+        records = list(result.scalars().all())
+    except Exception as exc:
+        logger.error("Failed to query liquidation audit logs: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve liquidation history from database"
+        )
+
+    has_more = len(records) > limit
+    if has_more:
+        records = records[:limit]
+
+    next_cursor = str(records[-1].id) if has_more and records else None
+
+    return LiquidationHistoryResponse(
+        records=[LiquidationAuditLogResponse.model_validate(r) for r in records],
+        next_cursor=next_cursor,
+        has_more=has_more
     )
